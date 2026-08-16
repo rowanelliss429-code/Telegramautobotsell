@@ -1,0 +1,15 @@
+{
+  "name": "telegram-automessage-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram AutoMessage bot with MongoDB and Render deployment",
+  "runtime": "python-3.11",
+  "main": "bot.py",
+  "scripts": {
+    "start": "python bot.py"
+  },
+  "dependencies": {
+    "python-telegram-bot": "22.5",
+    "pymongo": "4.15.0"
+  }
+}

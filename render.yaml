@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: telegram-automessage-bot
+    runtime: python
+    buildCommand: pip install python-telegram-bot==22.5 pymongo==4.15.0
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: DB_NAME
+        value: automessage_bot
