@@ -1,7 +1,10 @@
 import os
+import threading
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from zoneinfo import ZoneInfo
 
+import certifi
 from pymongo import MongoClient, ASCENDING
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
@@ -16,13 +19,20 @@ from telegram.ext import (
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGODB_URI = os.getenv("MONGODB_URI")
 DB_NAME = os.getenv("DB_NAME", "automessage_bot")
+PORT = int(os.getenv("PORT", "10000"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is missing")
 if not MONGODB_URI:
     raise RuntimeError("MONGODB_URI environment variable is missing")
 
-mongo_client = MongoClient(MONGODB_URI)
+mongo_client = MongoClient(
+    MONGODB_URI,
+    tls=True,
+    tlsCAFile=certifi.where(),
+    serverSelectionTimeoutMS=30000,
+    connectTimeoutMS=30000,
+)
 database = mongo_client[DB_NAME]
 users = database["users"]
 users.create_index([("telegram_id", ASCENDING)], unique=True)
@@ -140,7 +150,25 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     print(f"Bot error: {context.error}")
 
 
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Telegram bot is running")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server() -> None:
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"Health server listening on port {PORT}")
+    server.serve_forever()
+
+
 def main() -> None:
+    threading.Thread(target=start_health_server, daemon=True).start()
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))

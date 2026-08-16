@@ -1,10 +1,12 @@
 services:
-  - type: worker
+  - type: web
     name: telegram-automessage-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
       - key: BOT_TOKEN
         sync: false
       - key: MONGODB_URI
