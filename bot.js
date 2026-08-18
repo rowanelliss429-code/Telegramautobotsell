@@ -321,9 +321,9 @@ async function processJoinJob(jobId) {
       await db.collection("joinJobs").updateOne({ _id: jobId }, { $set: { status: "waiting", nextRunAt: new Date(Date.now() + cooldownMs) } });
       return scheduleJoinJob(jobId, cooldownMs);
     }
-    await bot.telegram.sendMessage(job.userId, `${target.inviteLink} join မအောင်မြင်ပါ။ User account link မဟုတ်ဘဲ public GP link သာ ပို့ရပါမယ်။`);
-    await db.collection("joinJobs").updateOne({ _id: jobId }, { $set: { targetIndex: job.targetIndex + 1, status: "running", nextRunAt: new Date(Date.now() + 5000) } });
-    return scheduleJoinJob(jobId, 5000);
+    await db.collection("joinJobs").updateOne({ _id: jobId }, { $set: { status: "failed", failedTargetIndex: job.targetIndex, failedAccountIndex: job.accountIndex }, $unset: { nextRunAt: "" } });
+    await bot.telegram.sendMessage(job.userId, `${target.inviteLink} join မအောင်မြင်ပါ။ User account link မဟုတ်ဘဲ public GP link သာ ပို့ရပါမယ်။`, Markup.inlineKeyboard([[Markup.button.callback("Edit GP link", `editgp:${jobId}:${job.accountIndex}:${job.targetIndex}`)]]));
+    return;
   }
 }
 
@@ -332,13 +332,20 @@ async function resumeJoinJobs() {
   for (const job of jobs) scheduleJoinJob(job._id, Math.max(0, new Date(job.nextRunAt || now()).getTime() - Date.now()));
 }
 
-async function sendCycle(userId, accountConfigs) {
+async function sendCycle(userId, accountConfigs, subscriptionId = null) {
   for (let accountIndex = 0; accountIndex < accountConfigs.length; accountIndex += 1) {
     const config = accountConfigs[accountIndex];
     const account = await db.collection("accounts").findOne({ _id: config.accountId, enabled: true });
     if (!account || !clientPool.has(String(account._id))) throw new Error(`Account ${accountIndex + 1} မရနိုင်ပါ။`);
     const client = clientPool.get(String(account._id));
     for (let i = 0; i < config.targets.length; i += 1) {
+      if (subscriptionId) {
+        const live = await db.collection("subscriptions").findOne({ _id: subscriptionId, status: "active" }, { projection: { sendPaused: 1 } });
+        if (!live || live.sendPaused) {
+          await bot.telegram.sendMessage(userId, "စာပို့ခြင်း ရပ်လိုက်ပါပြီ။");
+          return false;
+        }
+      }
       const target = config.targets[i];
       await sendWithAccount(client, target, config.messages?.[i] || "");
       await bot.telegram.sendMessage(userId, `GP${accountIndex + 1}-${i + 1} ပို့ပြီးပါပြီ။`);
@@ -348,6 +355,52 @@ async function sendCycle(userId, accountConfigs) {
       }
     }
   }
+  return true;
+}
+
+function remainingMinutes(dateValue) {
+  return Math.max(1, Math.ceil((new Date(dateValue).getTime() - Date.now()) / 60000));
+}
+
+async function getActiveUserSubscription(userId) {
+  await expireSubscriptions();
+  return db.collection("subscriptions").findOne({ userId: Number(userId), status: "active", expiresAt: { $gt: now() } });
+}
+
+async function startUserSend(userId, reply) {
+  const subscription = await getActiveUserSubscription(userId);
+  if (!subscription) return reply("Active plan မရှိတော့ပါ။", mainMenu);
+  if (!subscription.accountConfigs?.length || !subscription.accountConfigs.every(config => (config.messages || []).every(Boolean))) return reply("GP အားလုံးအတွက် စာသား မပြည့်သေးပါ။");
+  if (subscription.sendNextAt && new Date(subscription.sendNextAt) > now()) return reply(`GP ထဲသို့ စာပို့ရန် မိနစ် ${remainingMinutes(subscription.sendNextAt)} လိုပါသေးတယ်။`);
+  const current = await db.collection("subscriptions").findOneAndUpdate(
+    { _id: subscription._id, status: "active", $or: [{ sendNextAt: { $exists: false } }, { sendNextAt: { $lte: now() } }] },
+    { $set: { sendPaused: false, sendNextAt: new Date(Date.now() + 20 * 60 * 1000) } },
+    { returnDocument: "after" },
+  );
+  if (!current) return reply("စာပို့ခြင်းကို အခြားလုပ်ဆောင်မှုတစ်ခုက စတင်ထားပြီးဖြစ်ပါတယ်။ ခဏစောင့်ပါ။");
+  await reply("GP များကို စာပို့ရန် လုပ်ဆောင်နေပါပြီ။");
+  try {
+    const completed = await sendCycle(userId, current.accountConfigs, current._id);
+    if (completed) await reply("GP အားလုံးပို့ပြီးပါပြီ။ မိနစ် 20 နားနေပါသည်။");
+    scheduleRecurringSend(userId, current._id);
+  } catch (error) {
+    await reply(`စာပို့ခြင်း မအောင်မြင်ပါ: ${error.message}`);
+    scheduleRecurringSend(userId, current._id);
+  }
+}
+
+async function stopUserSend(userId, reply) {
+  const subscription = await getActiveUserSubscription(userId);
+  if (!subscription) return reply("Active plan မရှိတော့ပါ။", mainMenu);
+  const control = await db.collection("sendControls").findOne({ userId: Number(userId) });
+  if (control?.stopNextAt && new Date(control.stopNextAt) > now()) return reply(`Stop button ကို ထပ်နှိပ်ရန် မိနစ် ${remainingMinutes(control.stopNextAt)} စောင့်ပါ။`);
+  const changed = await db.collection("subscriptions").updateOne({ _id: subscription._id, status: "active" }, { $set: { sendPaused: true }, $unset: { nextSendAt: "" } });
+  await db.collection("sendControls").updateOne({ userId: Number(userId) }, { $set: { stopNextAt: new Date(Date.now() + 20 * 60 * 1000) } }, { upsert: true });
+  if (recurringTimers.has(String(subscription._id))) {
+    clearTimeout(recurringTimers.get(String(subscription._id)));
+    recurringTimers.delete(String(subscription._id));
+  }
+  return reply(changed.modifiedCount ? "စာပို့ခြင်း ရပ်လိုက်ပါပြီ။" : "စာပို့ခြင်း ရပ်ထားပြီးသားပါ။");
 }
 
 function scheduleRecurringSend(userId, subscriptionId) {
@@ -357,10 +410,14 @@ function scheduleRecurringSend(userId, subscriptionId) {
     try {
       await expireSubscriptions();
       const subscription = await db.collection("subscriptions").findOne({ _id: subscriptionId, userId, status: "active", expiresAt: { $gt: now() } });
-      if (!subscription || await isBanned(userId)) return;
+      if (!subscription || subscription.sendPaused || await isBanned(userId)) return;
+      if (subscription.sendNextAt && new Date(subscription.sendNextAt) > now()) return scheduleRecurringSend(userId, subscriptionId);
       await bot.telegram.sendMessage(userId, "မိနစ် 20 ပြည့်ပါပြီ။ GP1 မှ စာပြန်ပို့နေပါပြီ။");
-      await sendCycle(userId, subscription.accountConfigs || []);
-      await bot.telegram.sendMessage(userId, "GP အားလုံးထပ်ပို့ပြီးပါပြီ။ မိနစ် 20 နားနေပါသည်။");
+      const completed = await sendCycle(userId, subscription.accountConfigs || [], subscriptionId);
+      if (completed) {
+        await db.collection("subscriptions").updateOne({ _id: subscriptionId, status: "active" }, { $set: { sendNextAt: new Date(Date.now() + 20 * 60 * 1000) } });
+        await bot.telegram.sendMessage(userId, "GP အားလုံးထပ်ပို့ပြီးပါပြီ။ မိနစ် 20 နားနေပါသည်။");
+      }
       scheduleRecurringSend(userId, subscriptionId);
     } catch (error) {
       await bot.telegram.sendMessage(userId, `Auto send မအောင်မြင်ပါ: ${error.message}`).catch(() => {});
@@ -411,7 +468,7 @@ async function runUserJob(userId, accountConfigs) {
   }
 }
 
-const mainMenu = Markup.keyboard([["PLANS", "Balance"], ["GP", "Help"]]).resize();
+const mainMenu = Markup.keyboard([["PLANS", "Balance"], ["GP", "Help"], ["Send", "Stop"]]).resize();
 const paymentMenu = Markup.inlineKeyboard([
   [Markup.button.callback("KPay ဖြင့်ငွေဖြည့်မည်", "topup:KPay")],
   [Markup.button.callback("Wave Pay ဖြင့်ငွေဖြည့်မည်", "topup:WavePay")],
@@ -437,6 +494,16 @@ bot.hears("Balance", async ctx => {
   const user = await ensureUser(ctx);
   if (await isBanned(ctx.from.id)) return ctx.reply("သင့် account ကို Admin က ban လုပ်ထားပါတယ်။");
   await ctx.reply(`သင့် Balance မှာ ${user.balance || 0} Ks ရှိပါတယ်။`, paymentMenu);
+});
+
+bot.hears("Send", async ctx => {
+  if (await isBanned(ctx.from.id)) return ctx.reply("သင့် account ကို Admin က ban လုပ်ထားပါတယ်။");
+  await startUserSend(ctx.from.id, (text, markup) => ctx.reply(text, markup));
+});
+
+bot.hears("Stop", async ctx => {
+  if (await isBanned(ctx.from.id)) return ctx.reply("သင့် account ကို Admin က ban လုပ်ထားပါတယ်။");
+  await stopUserSend(ctx.from.id, (text, markup) => ctx.reply(text, markup));
 });
 
 bot.action(/^topup:(KPay|WavePay)$/, async ctx => {
@@ -542,7 +609,7 @@ bot.command("stop", adminOnly, async ctx => {
   if (type?.toLowerCase() !== "plan" || !userId || !/^\d+$/.test(userId)) return ctx.reply("အသုံးပြုပုံ: /stop plan USER_ID");
   const stopped = await stopUserPlans(Number(userId), "admin_stop");
   if (!stopped) return ctx.reply(`User ${userId} အတွက် active plan မတွေ့ပါ။`);
-  await bot.telegram.sendMessage(Number(userId), "Admin က သင့် plan အသုံးပြုမှုကို ရပ်လိုက်ပါပြီ။ Cashback မပေးပါ။ ထပ်သုံးရန် plan အသစ် ပြန်ဝယ်ပါ။").catch(() => {});
+  await bot.telegram.sendMessage(Number(userId), "Admin က သင့် plan အသုံးပြုမှုကို ရပ်လိုက်ပါပြီ။ ထပ်သုံးရန် plan အသစ် ပြန်ဝယ်ပါ။").catch(() => {});
   return ctx.reply(`User ${userId} ၏ plan ကို ရပ်ပြီး account ကို လွှတ်ပေးလိုက်ပါပြီ။ Cashback မပေးထားပါ။`);
 });
 
@@ -551,7 +618,7 @@ bot.command("stopplan", adminOnly, async ctx => {
   if (!userId || !/^\d+$/.test(userId)) return ctx.reply("အသုံးပြုပုံ: /stopplan USER_ID");
   const stopped = await stopUserPlans(Number(userId), "admin_stop");
   if (!stopped) return ctx.reply(`User ${userId} အတွက် active plan မတွေ့ပါ။`);
-  await bot.telegram.sendMessage(Number(userId), "Admin က သင့် plan အသုံးပြုမှုကို ရပ်လိုက်ပါပြီ။ Cashback မပေးပါ။ ထပ်သုံးရန် plan အသစ် ပြန်ဝယ်ပါ။").catch(() => {});
+  await bot.telegram.sendMessage(Number(userId), "Admin က သင့် plan အသုံးပြုမှုကို ရပ်လိုက်ပါပြီ။ ထပ်သုံးရန် plan အသစ် ပြန်ဝယ်ပါ။").catch(() => {});
   return ctx.reply(`User ${userId} ၏ plan ကို ရပ်ပြီး account ကို လွှတ်ပေးလိုက်ပါပြီ။ Cashback မပေးထားပါ။`);
 });
 
@@ -710,6 +777,14 @@ bot.command("status", adminOnly, async ctx => {
   await ctx.reply(`Accounts: ${accounts.length}\nConnected: ${accounts.filter(a => clientPool.has(String(a._id))).length}\nSending: ${sending ? "Yes" : "No"}`);
 });
 
+bot.action(/^editgp:([a-f0-9]{24}):(\d+):(\d+)$/, async ctx => {
+  await ctx.answerCbQuery();
+  if (await isBanned(ctx.from.id)) return ctx.reply("သင့် account ကို Admin က ban လုပ်ထားပါတယ်။");
+  const state = { step: "editGp", jobId: new ObjectId(ctx.match[1]), accountIndex: Number(ctx.match[2]), targetIndex: Number(ctx.match[3]) };
+  sessions.set(ctx.from.id, state);
+  return ctx.reply("အစားထိုးမည့် public GP link တစ်ခုတည်းသာ ပို့ပါ။ GP link အများကြီး မပို့ရပါ။\nဥပမာ: https://t.me/example");
+});
+
 bot.action(/^message:(\d+):(\d+)$/, async ctx => {
   await ctx.answerCbQuery();
   const state = sessions.get(ctx.from.id);
@@ -728,15 +803,7 @@ bot.action("send:all", async ctx => {
   if (await isBanned(ctx.from.id)) return ctx.reply("သင့် account ကို Admin က ban လုပ်ထားပါတယ်။");
   if (!state || !state.accountConfigs?.length || state.remainingMessages > 0) return ctx.reply("GP အားလုံးအတွက် စာသား မပြည့်သေးပါ။");
   sessions.delete(ctx.from.id);
-  await ctx.reply("စာသားပို့ခြင်း စတင်ပါပြီ။ GP တစ်ခုနှင့်တစ်ခုကြား 6 စက္ကန့်နားပါမယ်။");
-  try {
-    await sendCycle(ctx.from.id, state.accountConfigs);
-    await db.collection("subscriptions").updateOne({ _id: state.subscriptionId }, { $set: { accountConfigs: state.accountConfigs, nextSendAt: new Date(Date.now() + 20 * 60 * 1000) } });
-    await ctx.reply("GP အားလုံးပို့ပြီးပါပြီ။ မိနစ် 20 နားနေပါသည်။ ပြီးလျှင် GP1 မှ auto ပြန်ပို့ပါမယ်။");
-    scheduleRecurringSend(ctx.from.id, state.subscriptionId);
-  } catch (error) {
-    await ctx.reply(`စာပို့ခြင်း မအောင်မြင်ပါ: ${error.message}`);
-  }
+  await startUserSend(ctx.from.id, (text, markup) => ctx.reply(text, markup));
 });
 
 bot.on("text", async ctx => {
@@ -760,6 +827,23 @@ bot.on("text", async ctx => {
   }
   if (!state) return;
   if (await isBanned(ctx.from.id)) return ctx.reply("သင့် account ကို Admin က ban လုပ်ထားပါတယ်။");
+  if (state.step === "editGp") {
+    const links = ctx.message.text.split(",").map(value => value.trim()).filter(Boolean);
+    if (links.length !== 1) return ctx.reply("အစားထိုးမည့် GP link တစ်ခုတည်းသာ ပို့ပါ။");
+    if (!isPublicGpLink(links[0])) return ctx.reply("Public GP link တစ်ခုတည်းသာ ပို့ပါ။ User account link မပို့ရပါ။ ဥပမာ https://t.me/example");
+    const job = await db.collection("joinJobs").findOne({ _id: state.jobId, userId: ctx.from.id, status: "failed" });
+    if (!job) { sessions.delete(ctx.from.id); return ctx.reply("Edit လုပ်ရန် failed GP job မတွေ့တော့ပါ။"); }
+    const target = targetsFromUserLinks(links)[0];
+    const accountConfigs = job.accountConfigs.map((config, accountIndex) => accountIndex === state.accountIndex
+      ? { ...config, targets: config.targets.map((item, targetIndex) => targetIndex === state.targetIndex ? target : item) }
+      : config);
+    await db.collection("joinJobs").updateOne({ _id: job._id, status: "failed" }, { $set: { accountConfigs, status: "running", targetIndex: state.targetIndex, accountIndex: state.accountIndex, nextRunAt: new Date(Date.now() + 5000) } });
+    await db.collection("subscriptions").updateOne({ _id: job.subscriptionId }, { $set: { accountConfigs } });
+    sessions.delete(ctx.from.id);
+    await ctx.reply("GP link အသစ်ကို သိမ်းပြီးပါပြီ။ 5 စက္ကန့်နောက်တွင် ပြန် join စတင်ပါမယ်။");
+    scheduleJoinJob(job._id, 5000);
+    return;
+  }
   if (state.step === "topupAmount") {
     const amount = parseAmount(ctx.message.text);
     if (!Number.isInteger(amount) || amount < 1000) return ctx.reply("အနည်းဆုံး 1000 Ks ကစပြီး ဖြည့်ပေးပါ။");
@@ -815,13 +899,14 @@ bot.on("text", async ctx => {
     };
     const result = await db.collection("joinJobs").insertOne(job);
     await db.collection("subscriptions").updateOne({ _id: subscription._id }, { $set: { accountConfigs, joinJobId: result.insertedId } });
-    await ctx.reply("GP link အားလုံးရပါပြီ။ Account များဖြင့် GP join စတင်ပါမယ်။ 4 ခု join ပြီးတိုင်း 10 မိနစ် cooldown ကို database ထဲသိမ်းပြီး service ပြန်နိုးလာလျှင် auto ဆက်လုပ်ပါမယ်။");
+    await ctx.reply("GP link အားလုံးရပါပြီ။ GP များကို စတင် joined လုပ်ပါမည်။");
     scheduleJoinJob(result.insertedId, 0);
     return;
   }
   if (state.step === "messageInput") {
     const config = state.accountConfigs[state.accountIndex];
     config.messages[state.gpIndex] = ctx.message.text;
+    await db.collection("subscriptions").updateOne({ _id: state.subscriptionId, status: "active" }, { $set: { accountConfigs: state.accountConfigs } });
     const remainingMessages = state.remainingMessages - 1;
     const nextState = { ...state, step: "messagePick", remainingMessages };
     sessions.set(ctx.from.id, nextState);
