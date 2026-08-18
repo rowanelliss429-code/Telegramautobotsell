@@ -27,6 +27,7 @@ const sessions = new Map();
 const clientPool = new Map();
 let sending = false;
 const recurringTimers = new Map();
+const joinTimers = new Map();
 
 const plans = {
   one: {
@@ -231,44 +232,77 @@ function messageKeyboard(accountConfigs) {
   return Markup.inlineKeyboard(rows);
 }
 
-async function joinConfiguredTargets(userId, accountConfigs) {
-  for (let accountIndex = 0; accountIndex < accountConfigs.length; accountIndex += 1) {
-    const config = accountConfigs[accountIndex];
-    const account = await db.collection("accounts").findOne({ _id: config.accountId, enabled: true });
-    if (!account || !clientPool.has(String(account._id))) throw new Error(`Account ${accountIndex + 1} ချိတ်ဆက်ထားခြင်းမရှိပါ။`);
-    const client = clientPool.get(String(account._id));
-    await bot.telegram.sendMessage(userId, `Account ${accountIndex + 1} အတွက် GP join စတင်ပါပြီ။`);
-    let joined = 0;
-    for (let i = 0; i < config.targets.length; i += 1) {
-      const target = config.targets[i];
-      try {
-        await joinTarget(client, target);
-        joined += 1;
-        await bot.telegram.sendMessage(userId, `${target.inviteLink} joined ပြီးပါပြီ။`);
-      } catch (error) {
-        const floodMatch = String(error.message || "").match(/FLOOD_WAIT[_ ](\d+)/i);
-        const waitSeconds = Number(error.seconds || floodMatch?.[1] || 0);
-        if (waitSeconds > 0) {
-          const waitMs = Math.max(waitSeconds * 1000, 10 * 60 * 1000);
-          await bot.telegram.sendMessage(userId, `Telegram cooldown ဖြစ်နေပါသည်။ နောက် GP များကို ${Math.ceil(waitMs / 60000)} မိနစ်နေ auto ဆက် join ပါမယ်။`);
-          await sleep(waitMs);
-        } else {
-          await bot.telegram.sendMessage(userId, `${target.inviteLink} join မအောင်မြင်ပါ။ User account link မဟုတ်ဘဲ public GP link သာ ပို့ပါ။`);
-        }
-      }
-      if (i < config.targets.length - 1) {
-        if (joined > 0 && joined % 4 === 0) {
-          await bot.telegram.sendMessage(userId, `GP ${joined} ခု join ပြီးပါပြီ။ နောက် GP များကို 10 မိနစ်နေ auto ဆက် join ပါမယ်။`);
-          await sleep(10 * 60 * 1000);
-        } else {
-          await sleep(5000);
-        }
-      }
-    }
-    await bot.telegram.sendMessage(userId, `Account ${accountIndex + 1} အတွက် GP join ပြီးပါပြီ။`);
-  }
-  await bot.telegram.sendMessage(userId, "GP joined ခြင်းအကုန်အောင်မြင်ပါသည်။ 2 စက္ကန့်စောင့်ပြီး message ရေးရန် button များကို ပြပါမယ်။");
+function scheduleJoinJob(jobId, delayMs = 0) {
+  const key = String(jobId);
+  if (joinTimers.has(key)) clearTimeout(joinTimers.get(key));
+  const timer = setTimeout(() => {
+    joinTimers.delete(key);
+    processJoinJob(jobId).catch(error => console.error(`Join job ${jobId} failed:`, error));
+  }, Math.max(0, delayMs));
+  joinTimers.set(key, timer);
+}
+
+async function completeJoinJob(job) {
+  await db.collection("joinJobs").updateOne({ _id: job._id }, { $set: { status: "completed", completedAt: now() } });
+  await bot.telegram.sendMessage(job.userId, "GP joined ခြင်းအကုန်အောင်မြင်ပါသည်။ 2 စက္ကန့်စောင့်ပြီး message ရေးရန် button များကို ပြပါမယ်။");
   await sleep(2000);
+  const totalMessages = job.accountConfigs.reduce((sum, item) => sum + item.targets.length, 0);
+  sessions.set(job.userId, { step: "messagePick", accountConfigs: job.accountConfigs, subscriptionId: job.subscriptionId, remainingMessages: totalMessages });
+  return bot.telegram.sendMessage(job.userId, "ပို့မည့် message များ ပို့ပေးပါ။", messageKeyboard(job.accountConfigs));
+}
+
+async function processJoinJob(jobId) {
+  const job = await db.collection("joinJobs").findOne({ _id: jobId, status: { $in: ["running", "waiting"] } });
+  if (!job) return;
+  const nowTime = Date.now();
+  const nextRun = job.nextRunAt ? new Date(job.nextRunAt).getTime() : nowTime;
+  if (nextRun > nowTime) return scheduleJoinJob(jobId, nextRun - nowTime);
+  const config = job.accountConfigs[job.accountIndex];
+  if (!config) return completeJoinJob(job);
+  if (job.targetIndex === 0) await bot.telegram.sendMessage(job.userId, `Account ${job.accountIndex + 1} အတွက် GP join စတင်ပါပြီ။`);
+  const account = await db.collection("accounts").findOne({ _id: config.accountId, enabled: true });
+  if (!account || !clientPool.has(String(account._id))) throw new Error(`Account ${job.accountIndex + 1} ချိတ်ဆက်ထားခြင်းမရှိပါ။`);
+  const client = clientPool.get(String(account._id));
+  const target = config.targets[job.targetIndex];
+  try {
+    await joinTarget(client, target);
+    const joinedCount = job.joinedCount + 1;
+    await bot.telegram.sendMessage(job.userId, `${target.inviteLink} joined ပြီးပါပြီ။`);
+    const nextTargetIndex = job.targetIndex + 1;
+    const accountFinished = nextTargetIndex >= config.targets.length;
+    const allFinished = accountFinished && job.accountIndex + 1 >= job.accountConfigs.length;
+    if (allFinished) {
+      const completedJob = { ...job, targetIndex: nextTargetIndex, joinedCount };
+      return completeJoinJob(completedJob);
+    }
+    if (accountFinished) {
+      await bot.telegram.sendMessage(job.userId, `Account ${job.accountIndex + 1} အတွက် GP join ပြီးပါပြီ။`);
+      await db.collection("joinJobs").updateOne({ _id: jobId }, { $set: { accountIndex: job.accountIndex + 1, targetIndex: 0, joinedCount: 0, status: "running", nextRunAt: new Date(Date.now() + 5000) } });
+      return scheduleJoinJob(jobId, 5000);
+    }
+    const cooldownMs = joinedCount % 4 === 0 ? 10 * 60 * 1000 : 5000;
+    const status = joinedCount % 4 === 0 ? "waiting" : "running";
+    if (status === "waiting") await bot.telegram.sendMessage(job.userId, `GP ${joinedCount} ခု join ပြီးပါပြီ။ နောက် GP များကို 10 မိနစ်နေ auto ဆက် join ပါမယ်။`);
+    await db.collection("joinJobs").updateOne({ _id: jobId }, { $set: { targetIndex: nextTargetIndex, joinedCount, status, nextRunAt: new Date(Date.now() + cooldownMs) } });
+    return scheduleJoinJob(jobId, cooldownMs);
+  } catch (error) {
+    const floodMatch = String(error.message || "").match(/FLOOD_WAIT[_ ](\d+)/i);
+    const waitSeconds = Number(error.seconds || floodMatch?.[1] || 0);
+    if (waitSeconds > 0) {
+      const cooldownMs = Math.max(waitSeconds * 1000, 10 * 60 * 1000);
+      await bot.telegram.sendMessage(job.userId, `Telegram cooldown ဖြစ်နေပါသည်။ နောက် GP များကို ${Math.ceil(cooldownMs / 60000)} မိနစ်နေ auto ဆက် join ပါမယ်။`);
+      await db.collection("joinJobs").updateOne({ _id: jobId }, { $set: { status: "waiting", nextRunAt: new Date(Date.now() + cooldownMs) } });
+      return scheduleJoinJob(jobId, cooldownMs);
+    }
+    await bot.telegram.sendMessage(job.userId, `${target.inviteLink} join မအောင်မြင်ပါ။ User account link မဟုတ်ဘဲ public GP link သာ ပို့ရပါမယ်။`);
+    await db.collection("joinJobs").updateOne({ _id: jobId }, { $set: { targetIndex: job.targetIndex + 1, status: "running", nextRunAt: new Date(Date.now() + 5000) } });
+    return scheduleJoinJob(jobId, 5000);
+  }
+}
+
+async function resumeJoinJobs() {
+  const jobs = await db.collection("joinJobs").find({ status: { $in: ["running", "waiting"] } }).toArray();
+  for (const job of jobs) scheduleJoinJob(job._id, Math.max(0, new Date(job.nextRunAt || now()).getTime() - Date.now()));
 }
 
 async function sendCycle(userId, accountConfigs) {
@@ -408,7 +442,12 @@ bot.action(/^topup:(confirm|cancel):([a-f0-9]{24})$/, async ctx => {
 
 bot.on("photo", async ctx => {
   if (isAdmin(ctx)) return;
-  const state = sessions.get(ctx.from.id);
+  let state = sessions.get(ctx.from.id);
+  if (!state) {
+    const savedUser = await db.collection("users").findOne({ telegramId: ctx.from.id }, { projection: { paymentState: 1 } });
+    state = savedUser?.paymentState || null;
+    if (state) sessions.set(ctx.from.id, state);
+  }
   if (!state || state.step !== "topupReceipt") return;
   const fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
   const topup = await db.collection("topups").findOne({ _id: state.topupId, userId: ctx.from.id, status: "pending" });
@@ -416,9 +455,10 @@ bot.on("photo", async ctx => {
   await db.collection("topups").updateOne({ _id: topup._id }, { $set: { receiptFileId: fileId, receiptReceivedAt: now() } });
   await db.collection("users").updateOne({ telegramId: ctx.from.id }, { $unset: { paymentState: "" } });
   sessions.delete(ctx.from.id);
-  const caption = `Top-up request\nUser: ${ctx.from.id}\nMethod: ${topup.method}\nAmount: ${topup.amount} Ks`;
+  const caption = `Receipt ပုံ | User: ${ctx.from.id} | Method: ${topup.method} | Amount: ${topup.amount} Ks`;
+  await bot.telegram.sendMessage(ADMIN_ID, `ငွေဖြည့်တောင်းဆိုမှု ရရှိပါပြီ။\nUser ID: ${ctx.from.id}\nငွေဖြည့်ပမာဏ: ${topup.amount} Ks\nPayment: ${topup.method}`);
   await bot.telegram.sendPhoto(ADMIN_ID, fileId, { caption });
-  await bot.telegram.sendMessage(ADMIN_ID, `Receipt ကို စစ်ပြီး Confirm သို့ Cancel ရွေးပါ။`, Markup.inlineKeyboard([
+  await bot.telegram.sendMessage(ADMIN_ID, `အပေါ်က amount နှင့် receipt ကို စစ်ပြီး Confirm သို့ Cancel ရွေးပါ။`, Markup.inlineKeyboard([
     [Markup.button.callback("Confirm", `topup:confirm:${topup._id}`), Markup.button.callback("Cancel", `topup:cancel:${topup._id}`)],
   ]));
   await ctx.reply("ပြေစာကို Admin ထံ ပို့ပြီးပါပြီ။ Admin အတည်ပြုချက်ကို စောင့်ပါ။");
@@ -575,7 +615,12 @@ const pendingAccount = new Map();
 
 bot.on("document", async (ctx, next) => {
   if (isAdmin(ctx)) return next();
-  const state = sessions.get(ctx.from.id);
+  let state = sessions.get(ctx.from.id);
+  if (!state) {
+    const savedUser = await db.collection("users").findOne({ telegramId: ctx.from.id }, { projection: { paymentState: 1 } });
+    state = savedUser?.paymentState || null;
+    if (state) sessions.set(ctx.from.id, state);
+  }
   if (!state || state.step !== "topupReceipt") return next();
   const fileId = ctx.message.document.file_id;
   const topup = await db.collection("topups").findOne({ _id: state.topupId, userId: ctx.from.id, status: "pending" });
@@ -583,8 +628,9 @@ bot.on("document", async (ctx, next) => {
   await db.collection("topups").updateOne({ _id: topup._id }, { $set: { receiptFileId: fileId, receiptReceivedAt: now() } });
   await db.collection("users").updateOne({ telegramId: ctx.from.id }, { $unset: { paymentState: "" } });
   sessions.delete(ctx.from.id);
-  await bot.telegram.sendDocument(ADMIN_ID, fileId, { caption: `Top-up request | User: ${ctx.from.id} | Method: ${topup.method} | Amount: ${topup.amount} Ks` });
-  await bot.telegram.sendMessage(ADMIN_ID, "Receipt ကိုစစ်ပြီး Confirm သို့ Cancel ရွေးပါ။", Markup.inlineKeyboard([[Markup.button.callback("Confirm", `topup:confirm:${topup._id}`), Markup.button.callback("Cancel", `topup:cancel:${topup._id}`)]]));
+  await bot.telegram.sendMessage(ADMIN_ID, `ငွေဖြည့်တောင်းဆိုမှု ရရှိပါပြီ။\nUser ID: ${ctx.from.id}\nငွေဖြည့်ပမာဏ: ${topup.amount} Ks\nPayment: ${topup.method}`);
+  await bot.telegram.sendDocument(ADMIN_ID, fileId, { caption: `Receipt file | User: ${ctx.from.id} | Amount: ${topup.amount} Ks` });
+  await bot.telegram.sendMessage(ADMIN_ID, "အပေါ်က amount နှင့် receipt ကို စစ်ပြီး Confirm သို့ Cancel ရွေးပါ။", Markup.inlineKeyboard([[Markup.button.callback("Confirm", `topup:confirm:${topup._id}`), Markup.button.callback("Cancel", `topup:cancel:${topup._id}`)]]));
   return ctx.reply("ပြေစာကို Admin ထံ ပို့ပြီးပါပြီ။ Admin အတည်ပြုချက်ကို စောင့်ပါ။");
 });
 
@@ -686,7 +732,7 @@ bot.on("text", async ctx => {
     const receiptState = { step: "topupReceipt", topupId: result.insertedId };
     sessions.set(ctx.from.id, receiptState);
     await db.collection("users").updateOne({ telegramId: ctx.from.id }, { $set: { paymentState: receiptState } });
-    return ctx.reply(`${amount} Ks top-up request တင်ပြီးပါပြီ။\n\nယခု အကောင့်ကို ငွေလွှဲပါ။ ထို့နောက် ပြေစာပို့ပါ။\n\n${state.method}-${phone}\nName-${accountName}`);
+    return ctx.reply(`${amount} Ks top-up request တင်ပြီးပါပြီ။\n\n${state.method}-${phone}\nName-${accountName}\n\nယခု အကောင့်ကို ငွေလွှဲပါ။ ထို့နောက် ပြေစာပို့ပါ။`);
   }
   if (state.step === "topupReceipt") return ctx.reply("ငွေလွှဲပြီးသော ပြေစာ screenshot/photo သို့မဟုတ် .jpg/.png file ကို ပို့ပါ။");
   await expireSubscriptions();
@@ -709,15 +755,23 @@ bot.on("text", async ctx => {
       sessions.set(ctx.from.id, { ...state, step: "accountTargets", accountIndex: nextIndex, accountConfigs, gpCount: state.gpCount });
       return ctx.reply(`Account ${state.accountIndex + 1} GP link များ ရပါပြီ။ ယခု Account ${nextIndex + 1} အတွက် public GP link များ ပို့ပါ။`);
     }
-    await ctx.reply("GP link အားလုံးရပါပြီ။ Account များဖြင့် GP join စတင်ပါမယ်။");
-    try {
-      await joinConfiguredTargets(ctx.from.id, accountConfigs);
-      const totalMessages = accountConfigs.reduce((sum, config) => sum + config.targets.length, 0);
-      sessions.set(ctx.from.id, { step: "messagePick", accountConfigs, subscriptionId: subscription._id, remainingMessages: totalMessages });
-      await ctx.reply("ပို့မည့် message များ ပို့ပေးပါ။", messageKeyboard(accountConfigs));
-    } catch (error) {
-      await ctx.reply(`GP join flow မအောင်မြင်ပါ: ${error.message}`);
-    }
+    const existingJob = await db.collection("joinJobs").findOne({ subscriptionId: subscription._id, status: { $in: ["running", "waiting"] } });
+    if (existingJob) return ctx.reply("GP join job တစ်ခု လုပ်ဆောင်နေပြီးသားပါ။");
+    const job = {
+      userId: ctx.from.id,
+      subscriptionId: subscription._id,
+      accountConfigs,
+      accountIndex: 0,
+      targetIndex: 0,
+      joinedCount: 0,
+      status: "running",
+      nextRunAt: now(),
+      createdAt: now(),
+    };
+    const result = await db.collection("joinJobs").insertOne(job);
+    await db.collection("subscriptions").updateOne({ _id: subscription._id }, { $set: { accountConfigs, joinJobId: result.insertedId } });
+    await ctx.reply("GP link အားလုံးရပါပြီ။ Account များဖြင့် GP join စတင်ပါမယ်။ 4 ခု join ပြီးတိုင်း 10 မိနစ် cooldown ကို database ထဲသိမ်းပြီး service ပြန်နိုးလာလျှင် auto ဆက်လုပ်ပါမယ်။");
+    scheduleJoinJob(result.insertedId, 0);
     return;
   }
   if (state.step === "messageInput") {
@@ -735,6 +789,8 @@ async function main() {
   await mongo.connect();
   db = mongo.db(DB_NAME);
   await db.collection("users").createIndex({ telegramId: 1 }, { unique: true });
+  await db.collection("joinJobs").createIndex({ status: 1, nextRunAt: 1 });
+  await db.collection("joinJobs").createIndex({ subscriptionId: 1, status: 1 });
   await db.collection("accounts").createIndex({ name: 1 }, { unique: true });
   await db.collection("targets").createIndex({ chatId: 1 }, { unique: true });
   http.createServer((req, res) => { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("Telegram Bot is running"); }).listen(PORT, "0.0.0.0");
@@ -743,6 +799,7 @@ async function main() {
   await expireSubscriptions();
   await bot.launch({ dropPendingUpdates: true });
   await resumeRecurringSchedules();
+  await resumeJoinJobs();
   console.log("Merged Telegram bot started");
 }
 
