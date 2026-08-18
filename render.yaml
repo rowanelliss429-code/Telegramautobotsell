@@ -1,15 +1,19 @@
 services:
   - type: web
-    name: telegram-automessage-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    name: telegram-bot-api-safe-sender
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.8
       - key: BOT_TOKEN
         sync: false
-      - key: MONGODB_URI
+      - key: MONGO_URI
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
         sync: false
       - key: DB_NAME
-        value: automessage_bot
+        value: gpbot
