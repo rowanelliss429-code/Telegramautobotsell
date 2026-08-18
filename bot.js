@@ -122,6 +122,9 @@ async function loadPlanPrices() {
 }
 
 function now() { return new Date(); }
+function escapeHtml(value) {
+  return String(value || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 function isAdmin(ctx) { return Boolean(ctx.from && ctx.from.id === ADMIN_ID); }
 function nameOf(ctx) { return ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name || "User"); }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -371,8 +374,9 @@ async function getSessionFile(ctx, fileId) {
 }
 
 async function buildClient(sessionString) {
-  const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5 });
+  const client = new TelegramClient(new StringSession(sessionString), API_ID, API_HASH, { connectionRetries: 5, requestRetries: 3 });
   await client.connect();
+  if (!(await client.checkAuthorization())) throw new Error("Telegram session authorization မအောင်မြင်ပါ။ Admin account session အသစ်ထည့်ပါ။");
   return client;
 }
 
@@ -434,10 +438,13 @@ async function joinTarget(client, target) {
   }
   const entity = await client.getEntity(target.chatId || target.username);
   if (entity.className === "User") throw new Error("User account link မဟုတ်ဘဲ public GP link သာ ပို့ရပါမယ်။");
-  if (entity.className === "Channel") {
-    try { await client.invoke(new Api.channels.JoinChannel({ channel: entity })); } catch (error) {
-      if (!String(error.message).toLowerCase().includes("already")) throw error;
-    }
+  if (entity.className !== "Channel") throw new Error("Public Telegram Group/Channel link မဟုတ်ပါ။");
+  const inputChannel = await client.getInputEntity(entity);
+  try {
+    await client.invoke(new Api.channels.JoinChannel({ channel: inputChannel }));
+  } catch (error) {
+    const message = String(error.message || error).toLowerCase();
+    if (!message.includes("already") && !message.includes("user_already_participant")) throw error;
   }
   return entity;
 }
@@ -523,7 +530,7 @@ async function processJoinJob(jobId) {
   try {
     await joinTarget(client, target);
     const joinedCount = job.joinedCount + 1;
-    await bot.telegram.sendMessage(job.userId, `${target.inviteLink} joined ပြီးပါပြီ။`);
+    await bot.telegram.sendMessage(job.userId, `<code>${escapeHtml(target.inviteLink)}</code> joined ပြီးပါပြီ။`, { parse_mode: "HTML" });
     const nextTargetIndex = job.targetIndex + 1;
     const accountFinished = nextTargetIndex >= config.targets.length;
     const allFinished = accountFinished && job.accountIndex + 1 >= job.accountConfigs.length;
@@ -536,7 +543,7 @@ async function processJoinJob(jobId) {
           const today = new Date().toISOString().slice(0, 10);
           const currentUsage = subscription.editUsage?.dayKey === today ? subscription.editUsage : { dayKey: today, count: 0, total: subscription.editUsage?.total || 0 };
           await db.collection("subscriptions").updateOne({ _id: subscription._id, status: "active" }, { $set: { [`accountConfigs.${editFor.accountIndex}.targets.${editFor.targetIndex}`]: replacement, editUsage: { dayKey: today, count: currentUsage.count + 1, total: (currentUsage.total || 0) + 1 } } });
-          await bot.telegram.sendMessage(job.userId, `${replacement.inviteLink} joined ပြီးပါပြီ။ GP link ကို အစားထိုးပြီးပါပြီ။`);
+          await bot.telegram.sendMessage(job.userId, `<code>${escapeHtml(replacement.inviteLink)}</code> joined ပြီးပါပြီ။ GP link ကို အစားထိုးပြီးပါပြီ။`, { parse_mode: "HTML" });
         }
         await db.collection("joinJobs").updateOne({ _id: jobId }, { $set: { status: "completed", completedAt: now() } });
         return;
@@ -567,7 +574,8 @@ async function processJoinJob(jobId) {
     const editButton = job.editOnly
       ? Markup.inlineKeyboard([[Markup.button.callback("Edit GP link", `editlink:${job.subscriptionId}:${job.editFor.accountIndex}:${job.editFor.targetIndex}`)]])
       : Markup.inlineKeyboard([[Markup.button.callback("Edit GP link", `editgp:${jobId}:${job.accountIndex}:${job.targetIndex}`)]]);
-    await bot.telegram.sendMessage(job.userId, `${target.inviteLink} join မအောင်မြင်ပါ။ User account link မဟုတ်ဘဲ public GP link သာ ပို့ရပါမယ်။`, editButton);
+    const reason = String(error.message || "Telegram API error").replace(/\s+/g, " ").slice(0, 240);
+    await bot.telegram.sendMessage(job.userId, `<code>${escapeHtml(target.inviteLink)}</code> join မအောင်မြင်ပါ။\nအကြောင်းရင်း: ${escapeHtml(reason)}\nUser account link မဟုတ်ဘဲ public GP link သာ ပို့ရပါမယ်။`, { parse_mode: "HTML", ...editButton });
     return;
   }
 }
