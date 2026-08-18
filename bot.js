@@ -1328,7 +1328,8 @@ bot.on("text", async ctx => {
     return ctx.reply(`Account ${state.accountIndex + 1} အတွက် public GP link များ ပို့ပေးပါ။\nအနည်းဆုံး 1 ခုမှ အများဆုံး ${count} ခု ပို့ပါ။\nComma (,) ခံပြီး ပို့ပါ။\nဥပမာ: https://t.me/sellingggp,https://t.me/sellingmyanmargp`);
   }
   if (state.step === "accountTargets") {
-    const expectedCount = state.gpCounts?.[state.accountIndex] || state.gpCount;
+    const gpCounts = [...(state.gpCounts || [])];
+    const expectedCount = gpCounts[state.accountIndex] || state.gpCount;
     const links = ctx.message.text.split(",").map(value => value.trim()).filter(Boolean);
     if (links.length !== expectedCount) return ctx.reply(`Account ${state.accountIndex + 1} အတွက် GP link ${expectedCount} ခုတိတိ ပို့ပါ။ User account link မဟုတ်ဘဲ public GP link သာ ပို့ရပါမယ်။`);
     if (!links.every(isPublicGpLink)) return ctx.reply("Public GP link သာ ပို့ရပါမယ်။ User account link မပို့ရပါ။ ဥပမာ https://t.me/example");
@@ -1393,12 +1394,17 @@ async function main() {
   let launchAttempt = 0;
   while (true) {
     try {
+      await bot.telegram.deleteWebhook({ drop_pending_updates: true }).catch(error => console.error("Webhook cleanup warning:", error?.message || error));
       await bot.launch({ dropPendingUpdates: true });
       break;
     } catch (error) {
       launchAttempt += 1;
+      const detail = error?.response?.description || error?.message || String(error);
       console.error(`Telegram launch failed (attempt ${launchAttempt}):`, error?.stack || error);
-      await sleep(Math.min(60000, 5000 * launchAttempt));
+      if (String(detail).includes("409") || String(detail).toLowerCase().includes("other getupdates request")) {
+        console.error("Another instance is polling this BOT_TOKEN. Stop every old Render/local worker, then redeploy one instance only.");
+      }
+      await sleep(Math.min(120000, 10000 * launchAttempt));
     }
   }
   await resumeRecurringSchedules().catch(error => console.error("Recurring recovery error:", error));
