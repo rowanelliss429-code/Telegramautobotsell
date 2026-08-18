@@ -53,6 +53,10 @@ function now() { return new Date(); }
 function isAdmin(ctx) { return Boolean(ctx.from && ctx.from.id === ADMIN_ID); }
 function nameOf(ctx) { return ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name || "User"); }
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function parseAmount(value) {
+  const normalized = String(value || "").trim().replace(/,/g, "").replace(/\s*(?:ks|ကျပ်)\s*$/i, "");
+  return /^\d+$/.test(normalized) ? Number(normalized) : NaN;
+}
 function adminOnly(ctx, next) { if (isAdmin(ctx)) return next(); }
 
 async function ensureUser(ctx) {
@@ -377,8 +381,10 @@ bot.hears("Balance", async ctx => {
 bot.action(/^topup:(KPay|WavePay)$/, async ctx => {
   await ctx.answerCbQuery();
   if (await isBanned(ctx.from.id)) return ctx.reply("သင့် account ကို Admin က ban လုပ်ထားပါတယ်။");
-  sessions.set(ctx.from.id, { step: "topupAmount", method: ctx.match[1] });
-  await ctx.reply(`${ctx.match[1]} ဖြင့် ဖြည့်မည့်ငွေအရေအတွက် ပို့ပေးပါ။ (အနည်းဆုံး 1000 Ks မှ စဖြည့်ပါ)`);
+  const paymentState = { step: "topupAmount", method: ctx.match[1] };
+  sessions.set(ctx.from.id, paymentState);
+  await db.collection("users").updateOne({ telegramId: ctx.from.id }, { $set: { paymentState } }, { upsert: true });
+  await ctx.reply(`${ctx.match[1]} ဖြင့် ဖြည့်မည့်ငွေအရေအတွက် ပို့ပေးပါ။ (အနည်းဆုံး 1000 Ks မှ စဖြည့်ပါ)\nဥပမာ: 1000 သို့မဟုတ် 1000 Ks`);
 });
 
 bot.action(/^topup:(confirm|cancel):([a-f0-9]{24})$/, async ctx => {
@@ -389,12 +395,13 @@ bot.action(/^topup:(confirm|cancel):([a-f0-9]{24})$/, async ctx => {
   if (!topup) return ctx.reply("ဒီ top-up request ကို အတည်ပြုပြီးသား သို့မဟုတ် ပယ်ဖျက်ပြီးသား ဖြစ်ပါတယ်။");
   if (ctx.match[1] === "cancel") {
     await db.collection("topups").updateOne({ _id: topupId, status: "pending" }, { $set: { status: "cancelled", cancelledAt: now(), reviewedBy: ADMIN_ID } });
+    await db.collection("users").updateOne({ telegramId: topup.userId }, { $unset: { paymentState: "" } });
     await bot.telegram.sendMessage(topup.userId, `သင်တင်ထားသော ${topup.amount} Ks ${topup.method} ငွေဖြည့် request ကို Admin က cancel လုပ်လိုက်ပါပြီ။`);
     return ctx.reply(`Top-up ${topup.userId} ကို cancel လုပ်ပြီးပါပြီ။`);
   }
   const changed = await db.collection("topups").updateOne({ _id: topupId, status: "pending" }, { $set: { status: "confirmed", confirmedAt: now(), reviewedBy: ADMIN_ID } });
   if (!changed.modifiedCount) return ctx.reply("ဒီ top-up request ကို အခြားနေရာမှ ပြောင်းလဲပြီးပါပြီ။");
-  await db.collection("users").updateOne({ telegramId: topup.userId }, { $inc: { balance: topup.amount } }, { upsert: true });
+  await db.collection("users").updateOne({ telegramId: topup.userId }, { $inc: { balance: topup.amount }, $unset: { paymentState: "" } }, { upsert: true });
   await bot.telegram.sendMessage(topup.userId, `သင်တင်ထားသော ${topup.amount} Ks ကို Balance ထဲ ထည့်ပေးပြီးပါပြီ။`);
   await ctx.reply(`Top-up ${topup.userId} အတွက် ${topup.amount} Ks ဖြည့်ပြီးပါပြီ။`);
 });
@@ -407,6 +414,7 @@ bot.on("photo", async ctx => {
   const topup = await db.collection("topups").findOne({ _id: state.topupId, userId: ctx.from.id, status: "pending" });
   if (!topup) return ctx.reply("ဒီ top-up request မရှိတော့ပါ။ Balance menu မှ ပြန်စပါ။");
   await db.collection("topups").updateOne({ _id: topup._id }, { $set: { receiptFileId: fileId, receiptReceivedAt: now() } });
+  await db.collection("users").updateOne({ telegramId: ctx.from.id }, { $unset: { paymentState: "" } });
   sessions.delete(ctx.from.id);
   const caption = `Top-up request\nUser: ${ctx.from.id}\nMethod: ${topup.method}\nAmount: ${topup.amount} Ks`;
   await bot.telegram.sendPhoto(ADMIN_ID, fileId, { caption });
@@ -573,6 +581,7 @@ bot.on("document", async (ctx, next) => {
   const topup = await db.collection("topups").findOne({ _id: state.topupId, userId: ctx.from.id, status: "pending" });
   if (!topup) return ctx.reply("ဒီ top-up request မရှိတော့ပါ။ Balance menu မှ ပြန်စပါ။");
   await db.collection("topups").updateOne({ _id: topup._id }, { $set: { receiptFileId: fileId, receiptReceivedAt: now() } });
+  await db.collection("users").updateOne({ telegramId: ctx.from.id }, { $unset: { paymentState: "" } });
   sessions.delete(ctx.from.id);
   await bot.telegram.sendDocument(ADMIN_ID, fileId, { caption: `Top-up request | User: ${ctx.from.id} | Method: ${topup.method} | Amount: ${topup.amount} Ks` });
   await bot.telegram.sendMessage(ADMIN_ID, "Receipt ကိုစစ်ပြီး Confirm သို့ Cancel ရွေးပါ။", Markup.inlineKeyboard([[Markup.button.callback("Confirm", `topup:confirm:${topup._id}`), Markup.button.callback("Cancel", `topup:cancel:${topup._id}`)]]));
@@ -652,24 +661,32 @@ bot.on("text", async ctx => {
       return ctx.reply(`Connect မအောင်မြင်ပါ: ${error.message}`);
     }
   }
-  const state = sessions.get(ctx.from.id);
+  let state = sessions.get(ctx.from.id);
+  if (!state) {
+    const savedUser = await db.collection("users").findOne({ telegramId: ctx.from.id }, { projection: { paymentState: 1 } });
+    state = savedUser?.paymentState || null;
+    if (state) sessions.set(ctx.from.id, state);
+  }
   if (!state) return;
   if (await isBanned(ctx.from.id)) return ctx.reply("သင့် account ကို Admin က ban လုပ်ထားပါတယ်။");
   if (state.step === "topupAmount") {
-    const amount = Number(ctx.message.text.trim());
+    const amount = parseAmount(ctx.message.text);
     if (!Number.isInteger(amount) || amount < 1000) return ctx.reply("အနည်းဆုံး 1000 Ks ကစပြီး ဖြည့်ပေးပါ။");
     const settings = await getPaymentSettings();
     const phone = state.method === "KPay" ? settings.kpayPhone : settings.wavepayPhone;
     const accountName = state.method === "KPay" ? settings.kpayName : settings.wavepayName;
     if (!phone || !accountName) {
       sessions.delete(ctx.from.id);
+      await db.collection("users").updateOne({ telegramId: ctx.from.id }, { $unset: { paymentState: "" } });
       return ctx.reply(`${state.method} payment account ကို Admin က မထည့်ရသေးပါ။`);
     }
     const existingTopup = await db.collection("topups").findOne({ userId: ctx.from.id, status: "pending" });
     if (existingTopup) return ctx.reply("ယခင် top-up request ကို Admin အတည်ပြုရန် စောင့်ပါ။");
     const result = await db.collection("topups").insertOne({ userId: ctx.from.id, method: state.method, amount, status: "pending", createdAt: now() });
-    sessions.set(ctx.from.id, { step: "topupReceipt", topupId: result.insertedId });
-    return ctx.reply(`ယခု အကောင့်ကို ငွေလွှဲပါ။ ထို့နောက် ပြေစာပို့ပါ။\n\n${state.method}-${phone}\nName-${accountName}`);
+    const receiptState = { step: "topupReceipt", topupId: result.insertedId };
+    sessions.set(ctx.from.id, receiptState);
+    await db.collection("users").updateOne({ telegramId: ctx.from.id }, { $set: { paymentState: receiptState } });
+    return ctx.reply(`${amount} Ks top-up request တင်ပြီးပါပြီ။\n\nယခု အကောင့်ကို ငွေလွှဲပါ။ ထို့နောက် ပြေစာပို့ပါ။\n\n${state.method}-${phone}\nName-${accountName}`);
   }
   if (state.step === "topupReceipt") return ctx.reply("ငွေလွှဲပြီးသော ပြေစာ screenshot/photo သို့မဟုတ် .jpg/.png file ကို ပို့ပါ။");
   await expireSubscriptions();
