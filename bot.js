@@ -131,6 +131,33 @@ async function releaseAccounts(subscriptionId) {
   await db.collection("accounts").updateMany({ "lease.subscriptionId": subscriptionId }, { $unset: { lease: "" } });
 }
 
+async function stopUserPlans(userId, reason = "admin_stop") {
+  const subscriptions = await db.collection("subscriptions").find({ userId: Number(userId), status: "active" }).toArray();
+  for (const subscription of subscriptions) {
+    await db.collection("subscriptions").updateOne(
+      { _id: subscription._id, status: "active" },
+      { $set: { status: "stopped", stoppedAt: now(), stopReason: reason } },
+    );
+    await releaseAccounts(subscription._id);
+    const recurringKey = String(subscription._id);
+    if (recurringTimers.has(recurringKey)) {
+      clearTimeout(recurringTimers.get(recurringKey));
+      recurringTimers.delete(recurringKey);
+    }
+    const jobs = await db.collection("joinJobs").find({ subscriptionId: subscription._id, status: { $in: ["running", "waiting"] } }).toArray();
+    for (const job of jobs) {
+      await db.collection("joinJobs").updateOne({ _id: job._id, status: { $in: ["running", "waiting"] } }, { $set: { status: "stopped", stoppedAt: now(), stopReason: reason } });
+      const joinKey = String(job._id);
+      if (joinTimers.has(joinKey)) {
+        clearTimeout(joinTimers.get(joinKey));
+        joinTimers.delete(joinKey);
+      }
+    }
+  }
+  sessions.delete(Number(userId));
+  return subscriptions.length;
+}
+
 async function getSessionFile(ctx, fileId) {
   const info = await ctx.telegram.getFile(fileId);
   return new Promise((resolve, reject) => {
@@ -508,6 +535,24 @@ bot.action(/^duration:(one|two):(d1|d2|w1)$/, async ctx => {
   }
   sessions.set(ctx.from.id, { step: "gpCount", accountIndex: 0, accountCount: plans[planKey].accounts, accountIds: reserved.map(account => account._id), accountConfigs: [], subscriptionId: result.insertedId });
   await ctx.reply(`${duration.label} ဝယ်ပြီးပါပြီ။\n\nပို့မည့် GP အရေအတွက် ပို့ပေးပါ။ (အနည်းဆုံး 1 မှ အများဆုံး 8)`);
+});
+
+bot.command("stop", adminOnly, async ctx => {
+  const [, type, userId] = ctx.message.text.trim().split(/\s+/);
+  if (type?.toLowerCase() !== "plan" || !userId || !/^\d+$/.test(userId)) return ctx.reply("အသုံးပြုပုံ: /stop plan USER_ID");
+  const stopped = await stopUserPlans(Number(userId), "admin_stop");
+  if (!stopped) return ctx.reply(`User ${userId} အတွက် active plan မတွေ့ပါ။`);
+  await bot.telegram.sendMessage(Number(userId), "Admin က သင့် plan အသုံးပြုမှုကို ရပ်လိုက်ပါပြီ။ Cashback မပေးပါ။ ထပ်သုံးရန် plan အသစ် ပြန်ဝယ်ပါ။").catch(() => {});
+  return ctx.reply(`User ${userId} ၏ plan ကို ရပ်ပြီး account ကို လွှတ်ပေးလိုက်ပါပြီ။ Cashback မပေးထားပါ။`);
+});
+
+bot.command("stopplan", adminOnly, async ctx => {
+  const [, userId] = ctx.message.text.trim().split(/\s+/);
+  if (!userId || !/^\d+$/.test(userId)) return ctx.reply("အသုံးပြုပုံ: /stopplan USER_ID");
+  const stopped = await stopUserPlans(Number(userId), "admin_stop");
+  if (!stopped) return ctx.reply(`User ${userId} အတွက် active plan မတွေ့ပါ။`);
+  await bot.telegram.sendMessage(Number(userId), "Admin က သင့် plan အသုံးပြုမှုကို ရပ်လိုက်ပါပြီ။ Cashback မပေးပါ။ ထပ်သုံးရန် plan အသစ် ပြန်ဝယ်ပါ။").catch(() => {});
+  return ctx.reply(`User ${userId} ၏ plan ကို ရပ်ပြီး account ကို လွှတ်ပေးလိုက်ပါပြီ။ Cashback မပေးထားပါ။`);
 });
 
 bot.command("ban", adminOnly, async ctx => {
